@@ -1,0 +1,4 @@
+model,test_rmse_hours,test_mae_hours,r2,cv_rmse_hours
+random_forest,0.579,0.429,0.854,0.531
+linear_regression,0.664,0.489,0.807,0.654
+decision_tree,0.703,0.538,0.784,0.693

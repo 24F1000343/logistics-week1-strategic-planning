@@ -1,89 +1,141 @@
 """
-Week 3 - simulating a logistics dataset for a regional parcel delivery
-company operating across a mix of metro and tier-2 cities in India.
+generate_data.py
 
-I couldn't get hold of a real proprietary dataset (most courier companies
-don't publish shipment-level data), so this is a synthetic dataset built
-to mimic the structure and rough distributions you'd see in a real one -
-based on patterns described in public logistics/e-commerce delivery
-reports. Documented in the report itself.
+Creates a simulated logistics shipment dataset for the Week 4 task
+(Predictive Modeling and Optimization in Logistics Systems).
+
+Since we don't have access to a real carrier's data during this
+internship, this script builds a synthetic dataset whose structure
+and relationships mirror what a genuine shipment dataset looks like:
+distance, weight, stops, traffic and weather all push delivery time
+up, with realistic noise, a few missing values, and a few outliers
+mixed in on purpose so the cleaning steps in preprocessing.py have
+something real to do.
+
+Run:
+    python src/generate_data.py
+Produces:
+    data/logistics_shipments.csv
 """
 
 import numpy as np
 import pandas as pd
 
-np.random.seed(42)
+RANDOM_SEED = 42
+N_ROWS = 5000
 
-n = 2000
 
-cities = ["Bengaluru", "Chennai", "Hyderabad", "Pune", "Coimbatore", "Nagpur", "Indore", "Kochi"]
-city_tier = {
-    "Bengaluru": "Tier-1", "Chennai": "Tier-1", "Hyderabad": "Tier-1", "Pune": "Tier-1",
-    "Coimbatore": "Tier-2", "Nagpur": "Tier-2", "Indore": "Tier-2", "Kochi": "Tier-2"
-}
+def generate_dataset(n_rows: int = N_ROWS, seed: int = RANDOM_SEED) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
 
-modes = ["Road", "Air", "Rail"]
-mode_probs = [0.72, 0.18, 0.10]
+    distance_km = rng.gamma(shape=6.0, scale=8.0, size=n_rows)          # ~10-150 km
+    shipment_weight_kg = rng.gamma(shape=2.0, scale=15.0, size=n_rows)  # skewed weight
+    num_stops_on_route = rng.poisson(lam=3, size=n_rows)
+    dispatch_hour = rng.integers(0, 24, size=n_rows)
+    day_of_week = rng.choice(
+        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"], size=n_rows
+    )
+    weather_condition = rng.choice(
+        ["clear", "rain", "fog"], size=n_rows, p=[0.7, 0.22, 0.08]
+    )
+    vehicle_type = rng.choice(
+        ["van", "small_truck", "large_truck"], size=n_rows, p=[0.5, 0.35, 0.15]
+    )
 
-carriers = ["InHouse Fleet", "Partner-A", "Partner-B"]
+    # Traffic is worse during rush hours (7-10 and 16-19) - mild collinearity
+    # with dispatch_hour, intentionally, so the cleaning/EDA steps have to
+    # deal with it.
+    base_traffic = rng.uniform(1, 6, size=n_rows)
+    rush_hour_mask = np.isin(dispatch_hour, [7, 8, 9, 16, 17, 18])
+    traffic_index = np.clip(
+        base_traffic + rush_hour_mask * rng.uniform(2, 4, size=n_rows), 1, 10
+    )
 
-df = pd.DataFrame({
-    "shipment_id": range(1, n + 1),
-    "origin_city": np.random.choice(cities, n),
-    "dest_city": np.random.choice(cities, n),
-    "mode": np.random.choice(modes, n, p=mode_probs),
-    "carrier": np.random.choice(carriers, n, p=[0.5, 0.3, 0.2]),
-})
+    weather_multiplier = np.select(
+        [weather_condition == "rain", weather_condition == "fog"],
+        [0.35, 0.7],
+        default=0.0,
+    )
+    vehicle_penalty = np.select(
+        [vehicle_type == "small_truck", vehicle_type == "large_truck"],
+        [0.15, 0.35],
+        default=0.0,
+    )
 
-# drop same-city shipments (not realistic for this dataset)
-df = df[df.origin_city != df.dest_city].reset_index(drop=True)
-n = len(df)
+    noise = rng.normal(0, 0.4, size=n_rows)
 
-df["dest_tier"] = df["dest_city"].map(city_tier)
+    # Non-linear / interaction / threshold effects on purpose:
+    #  - traffic has an accelerating (squared) effect as congestion builds
+    #  - a hard "gridlock" penalty kicks in once traffic crosses a threshold
+    #  - bad weather costs more on longer routes (interaction with distance)
+    #  - a long route AND bad weather together trigger an extra compounding
+    #    delay (a genuine interaction, not just additive)
+    #  - routes with many stops get an extra fatigue/delay penalty past a
+    #    threshold, and that penalty is worse in heavy traffic
+    # These kinks and thresholds are exactly what a plain linear model
+    # cannot represent but a tree-based model can, which is the gap the
+    # model comparison in evaluate.py is designed to reveal.
+    traffic_effect = 0.10 * traffic_index + 0.018 * traffic_index**2
+    gridlock_penalty = np.where(traffic_index > 7.5, 1.4, 0.0)
 
-# distance is roughly correlated with tier-2 destinations being farther
-# from the main hubs, plus random spread
-base_distance = np.where(df.dest_tier == "Tier-2", 650, 350)
-df["distance_km"] = np.round(base_distance + np.random.normal(0, 180, n)).clip(40, 2200)
+    weather_distance_interaction = weather_multiplier * (distance_km / 40.0)
+    long_route_bad_weather_penalty = np.where(
+        (distance_km > 90) & (weather_condition != "clear"), 1.2, 0.0
+    )
 
-# shipment weight in kg (right-skewed - most parcels are light, a long
-# tail of bulk/commercial shipments)
-df["weight_kg"] = np.round(np.random.gamma(shape=2.0, scale=3.2, size=n), 2).clip(0.2, 80)
+    many_stops_penalty = np.where(num_stops_on_route >= 6, 0.8, 0.0)
+    stops_traffic_interaction = 0.05 * num_stops_on_route * (traffic_index / 5.0)
+    stops_traffic_compounding = np.where(
+        (num_stops_on_route >= 6) & (traffic_index > 7.5), 1.0, 0.0
+    )
 
-# base delivery time depends on distance and mode, with air fastest per km
-mode_speed_factor = df["mode"].map({"Road": 1.0, "Rail": 0.85, "Air": 0.35})
-noise = np.random.normal(0, 0.6, n)
-df["delivery_time_days"] = np.round(
-    1.0 + (df["distance_km"] / 450) * mode_speed_factor + noise.clip(-0.8, 3), 1
-).clip(0.5, 12)
+    delivery_time_hours = (
+        0.04 * distance_km
+        + 0.01 * shipment_weight_kg
+        + 0.20 * num_stops_on_route
+        + traffic_effect
+        + gridlock_penalty
+        + weather_distance_interaction
+        + long_route_bad_weather_penalty
+        + many_stops_penalty
+        + stops_traffic_interaction
+        + stops_traffic_compounding
+        + vehicle_penalty
+        + 1.0  # base handling/loading time
+        + noise
+    )
+    delivery_time_hours = np.clip(delivery_time_hours, 0.5, None)
 
-# transportation cost: fixed handling fee + per-km + per-kg, with mode
-# multiplier (air costs more)
-mode_cost_factor = df["mode"].map({"Road": 1.0, "Rail": 0.8, "Air": 2.6})
-df["cost_inr"] = np.round(
-    (80 + df["distance_km"] * 0.9 + df["weight_kg"] * 25) * mode_cost_factor
-    + np.random.normal(0, 60, n)
-).clip(120, None)
+    df = pd.DataFrame(
+        {
+            "distance_km": distance_km.round(2),
+            "shipment_weight_kg": shipment_weight_kg.round(1),
+            "num_stops_on_route": num_stops_on_route,
+            "dispatch_hour": dispatch_hour,
+            "day_of_week": day_of_week,
+            "weather_condition": weather_condition,
+            "vehicle_type": vehicle_type,
+            "traffic_index": traffic_index.round(2),
+            "delivery_time_hours": delivery_time_hours.round(2),
+        }
+    )
 
-# delay flag: shipments that took notably longer than the mode/distance
-# would predict, plus a random operational-issue component (~12% base rate)
-expected_days = 1.0 + (df["distance_km"] / 450) * mode_speed_factor
-delay_prob = np.clip(0.08 + (df["delivery_time_days"] - expected_days) * 0.12, 0.02, 0.9)
-df["delayed"] = np.random.binomial(1, delay_prob)
+    # --- Inject realistic imperfections on purpose ---
+    # 1) A handful of missing weather readings
+    missing_idx = rng.choice(n_rows, size=int(0.02 * n_rows), replace=False)
+    df.loc[missing_idx, "weather_condition"] = np.nan
 
-# a few genuine missing values and a couple of stray outliers, since
-# that's realistic for logistics ops data and week 2's task dealt with it
-missing_idx = np.random.choice(df.index, size=25, replace=False)
-df.loc[missing_idx, "weight_kg"] = np.nan
+    # 2) A few unrealistic distance outliers (sensor / logging errors)
+    outlier_idx = rng.choice(n_rows, size=int(0.005 * n_rows), replace=False)
+    df.loc[outlier_idx, "distance_km"] = df.loc[outlier_idx, "distance_km"] * rng.uniform(
+        6, 10, size=len(outlier_idx)
+    )
 
-outlier_idx = np.random.choice(df.index, size=6, replace=False)
-df.loc[outlier_idx, "cost_inr"] = df.loc[outlier_idx, "cost_inr"] * 4.5
+    return df
 
-df["ship_date"] = pd.to_datetime("2026-01-01") + pd.to_timedelta(
-    np.random.randint(0, 240, n), unit="D"
-)
 
-df.to_csv("/home/claude/week3/logistics_shipments.csv", index=False)
-print(df.shape)
-print(df.head())
-print(df.isna().sum())
+if __name__ == "__main__":
+    dataset = generate_dataset()
+    dataset.to_csv("data/logistics_shipments.csv", index=False)
+    print(f"Saved {len(dataset)} rows to data/logistics_shipments.csv")
+    print(dataset.head())
